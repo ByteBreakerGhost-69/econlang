@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = [
+    "compiler/lexer",
+    "compiler/parser",
+    "compiler/ast",
+    "compiler/semantics",
+    "compiler/typechecker",
+    "compiler/ir",
+    "compiler/optimizer",
+    "compiler/codegen",
+    "compiler/econc",
+]
