@@ -1,0 +1,6 @@
+fn main() {
+    let x: Int64 = 10;
+    let y: Int64 = 20;
+    let result = x + y;
+    return result;
+}

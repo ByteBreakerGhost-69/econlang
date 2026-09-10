@@ -13,6 +13,9 @@ version = "0.1.0"
 [[package]]
 name = "econc"
 version = "0.1.0"
+dependencies = [
+ "parser",
+]
 
 [[package]]
 name = "ir"
