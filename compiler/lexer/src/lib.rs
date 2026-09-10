@@ -24,6 +24,7 @@ pub enum TokenKind {
     Let,
     Var,
     Const,
+    In,
     Struct,
     Enum,
     Trait,
@@ -57,6 +58,7 @@ pub enum TokenKind {
     // Operators
     Plus,
     Minus,
+    Arrow,
     Star,
     Slash,
     Percent,
@@ -204,6 +206,8 @@ impl<'a> Lexer<'a> {
             b'-' => {
                 if self.match_byte(b'=') {
                     TokenKind::MinusEqual
+                } else if self.match_byte(b'>') {
+                    TokenKind::Arrow
                 } else {
                     TokenKind::Minus
                 }
@@ -342,6 +346,7 @@ impl<'a> Lexer<'a> {
             "let" => TokenKind::Let,
             "var" => TokenKind::Var,
             "const" => TokenKind::Const,
+            "in" => TokenKind::In,
             "struct" => TokenKind::Struct,
             "enum" => TokenKind::Enum,
             "trait" => TokenKind::Trait,
@@ -580,5 +585,17 @@ mod tests {
             tokens.last().map(|token| &token.kind),
             Some(&TokenKind::Eof)
         );
+    }
+
+    #[test]
+    fn lex_for_keyword() {
+        let source = "for i in 0..10";
+
+        let mut lexer = Lexer::new(source);
+        let tokens = lexer.tokenize().expect("lexing should succeed");
+
+        assert_eq!(tokens[0].kind, TokenKind::For);
+        assert_eq!(tokens[1].kind, TokenKind::Identifier("i".to_string()));
+        assert_eq!(tokens[2].kind, TokenKind::In);
     }
 }

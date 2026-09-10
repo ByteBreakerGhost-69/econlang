@@ -257,6 +257,7 @@ pub enum Expr {
     Literal(LiteralExpr),
     Identifier(IdentifierExpr),
     Binary(BinaryExpr),
+    Assignment(AssignmentExpr),
     Unary(UnaryExpr),
     Call(CallExpr),
     Member(MemberExpr),
@@ -305,6 +306,23 @@ pub struct BinaryExpr {
     pub operator: BinaryOperator,
     pub right: Box<Expr>,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssignmentExpr {
+    pub target: Box<Expr>,
+    pub operator: AssignmentOperator,
+    pub value: Box<Expr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignmentOperator {
+    Assign,
+    AddAssign,
+    SubAssign,
+    MulAssign,
+    DivAssign,
 }
 
 /// Unary expression.
