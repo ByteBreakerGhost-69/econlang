@@ -172,6 +172,14 @@ impl Parser {
             TokenKind::Parallel => self.parse_parallel_for_statement(),
             TokenKind::Break => self.parse_break_statement(),
             TokenKind::Continue => self.parse_continue_statement(),
+            TokenKind::If => {
+                // Control-flow `if` expressions may stand alone as statements
+                // and therefore do not require a trailing semicolon.
+                let expr = self.parse_expression()?;
+                let span = expr_span(&expr);
+
+                Ok(Stmt::Expr(ExprStmt { expr, span }))
+            }
             _ => {
                 let expr = self.parse_expression()?;
                 let span = expr_span(&expr);
@@ -1193,5 +1201,24 @@ mod tests {
         parser
             .parse_program()
             .expect("index/member parsing should succeed");
+    }
+
+    #[test]
+    fn parses_if_statement_without_semicolon() {
+        let source = r#"
+            fn main() {
+                let x = 10;
+
+                if x > 0 {
+                    let y = x + 1;
+                    return y;
+                }
+            }
+        "#;
+
+        let mut parser = Parser::from_source(source).expect("source should lex");
+        let program = parser.parse_program().expect("source should parse");
+
+        assert_eq!(program.declarations.len(), 1);
     }
 }
