@@ -53,6 +53,13 @@ enum BorrowState {
     Mutable,
 }
 
+/// Ownership state of a local binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnershipState {
+    Available,
+    Moved,
+}
+
 /// A local binding known by the type checker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct BindingId(usize);
@@ -63,6 +70,7 @@ struct Binding {
     ty: Type,
     mutable: bool,
     span: Span,
+    ownership: OwnershipState,
 }
 
 /// A function signature.
@@ -198,6 +206,7 @@ impl TypeChecker {
                         ty,
                         mutable: false,
                         span: parameter.span,
+                        ownership: OwnershipState::Available,
                     },
                 );
         }
@@ -236,7 +245,10 @@ impl TypeChecker {
                 let value_type = let_stmt
                     .value
                     .as_ref()
-                    .map(|expr| self.check_expr(expr))
+                    .map(|expr| match expr {
+                        Expr::Identifier(identifier) => self.check_move_identifier(identifier),
+                        _ => self.check_expr(expr),
+                    })
                     .unwrap_or(Type::Unknown);
 
                 let binding_type = if let Some(type_expr) = &let_stmt.ty {
@@ -283,7 +295,10 @@ impl TypeChecker {
                 let actual = return_stmt
                     .value
                     .as_ref()
-                    .map(|expr| self.check_expr(expr))
+                    .map(|expr| match expr {
+                        Expr::Identifier(identifier) => self.check_move_identifier(identifier),
+                        _ => self.check_expr(expr),
+                    })
                     .unwrap_or(Type::Unit);
 
                 if self.current_return_type == Type::Unknown {
@@ -377,7 +392,10 @@ impl TypeChecker {
             }
 
             Expr::Assignment(assignment) => {
-                let value_type = self.check_expr(&assignment.value);
+                let value_type = match assignment.value.as_ref() {
+                    Expr::Identifier(identifier) => self.check_move_identifier(identifier),
+                    _ => self.check_expr(&assignment.value),
+                };
 
                 match assignment.target.as_ref() {
                     Expr::Identifier(identifier) => {
@@ -517,8 +535,38 @@ impl TypeChecker {
 
                 match object_type {
                     Type::Array(inner) => *inner,
+
                     Type::String => Type::Char,
+
+                    Type::Tuple(elements) => {
+                        if index.indices.len() != 1 {
+                            self.error("tuple indexing requires exactly one index", index.span);
+                            return Type::Unknown;
+                        }
+
+                        let index_expr = &index.indices[0];
+
+                        let Some(index_value) = tuple_index_value(index_expr) else {
+                            self.error(
+                                "tuple index must be a constant integer",
+                                index_expr_span(index_expr),
+                            );
+                            return Type::Unknown;
+                        };
+
+                        let index = index_value as usize;
+
+                        elements.get(index).cloned().unwrap_or_else(|| {
+                            self.error(
+                                format!("tuple index {} is out of bounds", index),
+                                index_expr_span(index_expr),
+                            );
+                            Type::Unknown
+                        })
+                    }
+
                     Type::Unknown => Type::Unknown,
+
                     _ => {
                         self.error("value is not indexable", index.span);
                         Type::Unknown
@@ -724,7 +772,10 @@ impl TypeChecker {
         }
 
         for (index, argument) in call.arguments.iter().enumerate() {
-            let actual = self.check_expr(argument);
+            let actual = match argument {
+                Expr::Identifier(identifier) => self.check_move_identifier(identifier),
+                _ => self.check_expr(argument),
+            };
 
             if let Some(expected) = signature.parameters.get(index) {
                 self.require_assignable(
@@ -926,6 +977,7 @@ impl TypeChecker {
                         ty,
                         mutable,
                         span: *span,
+                        ownership: OwnershipState::Available,
                     },
                 );
             }
@@ -1054,6 +1106,55 @@ impl TypeChecker {
         }
     }
 
+    fn check_move_identifier(&mut self, identifier: &ast::IdentifierExpr) -> Type {
+        let Some(binding) = self.lookup(&identifier.name).cloned() else {
+            return Type::Unknown;
+        };
+
+        if let Some(borrow_state) = self.borrows.get(&binding.id).copied() {
+            let message = match borrow_state {
+                BorrowState::Shared(_) => {
+                    format!(
+                        "cannot move `{}` while a shared borrow is active",
+                        identifier.name
+                    )
+                }
+                BorrowState::Mutable => {
+                    format!(
+                        "cannot move `{}` while a mutable borrow is active",
+                        identifier.name
+                    )
+                }
+            };
+
+            self.error(message, identifier.span);
+            return binding.ty;
+        }
+
+        if binding.ownership == OwnershipState::Moved {
+            self.error(
+                format!("use of moved value `{}`", identifier.name),
+                identifier.span,
+            );
+            return binding.ty;
+        }
+
+        if !self.is_copy_type(&binding.ty) {
+            if let Some(scope) = self
+                .scopes
+                .iter_mut()
+                .rev()
+                .find(|scope| scope.contains_key(&identifier.name))
+            {
+                if let Some(binding) = scope.get_mut(&identifier.name) {
+                    binding.ownership = OwnershipState::Moved;
+                }
+            }
+        }
+
+        binding.ty
+    }
+
     fn require_type(&mut self, expected: &Type, actual: &Type, span: Span, message: &str) {
         if actual == &Type::Unknown {
             return;
@@ -1082,6 +1183,31 @@ impl TypeChecker {
         }
 
         left == right
+    }
+
+    fn is_copy_type(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Unit
+            | Type::Bool
+            | Type::Char
+            | Type::Int8
+            | Type::Int16
+            | Type::Int32
+            | Type::Int64
+            | Type::Int128
+            | Type::UInt8
+            | Type::UInt16
+            | Type::UInt32
+            | Type::UInt64
+            | Type::UInt128
+            | Type::Float32
+            | Type::Float64
+            | Type::Reference { .. } => true,
+
+            Type::Tuple(elements) => elements.iter().all(|element| self.is_copy_type(element)),
+
+            _ => false,
+        }
     }
 
     fn is_numeric(&self, ty: &Type) -> bool {
@@ -1120,6 +1246,16 @@ impl TypeChecker {
 /// Convenience entry point.
 pub fn check(program: &Program) -> TypeCheckResult {
     TypeChecker::new().check(program)
+}
+
+fn tuple_index_value(expression: &Expr) -> Option<u64> {
+    match expression {
+        Expr::Literal(literal) => match &literal.value {
+            ast::LiteralValue::Integer(value) => value.parse::<u64>().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn expression_span(expression: &Expr) -> Span {
@@ -1453,5 +1589,315 @@ mod tests {
         );
 
         assert!(result.is_ok(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn rejects_use_after_move() {
+        let result = check_source(
+            r#"
+            fn main() {
+                let a = "hello";
+                let b = a;
+                let c = a;
+            }
+            "#,
+        );
+
+        assert!(result.has_errors());
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.message.contains("use of moved value `a`") })
+        );
+    }
+
+    #[test]
+    fn accepts_copy_type_after_assignment() {
+        let result = check_source(
+            r#"
+            fn main() {
+                let a = 10;
+                let b = a;
+                let c = a;
+            }
+            "#,
+        );
+
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn rejects_use_after_move_through_function_argument() {
+        let result = check_source(
+            r#"
+            fn consume(value: String) {
+                return;
+            }
+
+            fn main() {
+                let a = "hello";
+                consume(a);
+                let b = a;
+            }
+            "#,
+        );
+
+        assert!(result.has_errors());
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.message.contains("use of moved value `a`") })
+        );
+    }
+
+    #[test]
+    fn accepts_copy_type_after_function_argument() {
+        let result = check_source(
+            r#"
+            fn consume(value: Int64) {
+                return;
+            }
+
+            fn main() {
+                let a = 10;
+                consume(a);
+                let b = a;
+            }
+            "#,
+        );
+
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn accepts_move_through_return() {
+        let result = check_source(
+            r#"
+            fn create() -> String {
+                let value = "hello";
+                return value;
+            }
+
+            fn main() {
+                let result = create();
+            }
+            "#,
+        );
+
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn rejects_use_after_move_before_return() {
+        let result = check_source(
+            r#"
+            fn create() -> String {
+                let value = "hello";
+                let other = value;
+                return value;
+            }
+            "#,
+        );
+
+        assert!(result.has_errors());
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.message.contains("use of moved value `value`") })
+        );
+    }
+
+    #[test]
+    fn rejects_move_while_shared_borrow_is_active() {
+        let result = check_source(
+            r#"
+            fn main() {
+                var x: String = "hello";
+                let r = &x;
+                let y = x;
+            }
+            "#,
+        );
+
+        assert!(result.has_errors());
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("cannot move `x` while a shared borrow is active")
+        }));
+    }
+
+    #[test]
+    fn rejects_move_while_mutable_borrow_is_active() {
+        let result = check_source(
+            r#"
+            fn main() {
+                var x: String = "hello";
+                let r = &mut x;
+                let y = x;
+            }
+            "#,
+        );
+
+        assert!(result.has_errors());
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("cannot move `x` while a mutable borrow is active")
+        }));
+    }
+
+    #[test]
+    fn accepts_move_after_borrow_scope_ends() {
+        let result = check_source(
+            r#"
+            fn main() {
+                var x: String = "hello";
+
+                if true {
+                    let r = &x;
+                }
+
+                let y = x;
+            }
+            "#,
+        );
+
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn rejects_use_after_move_through_assignment() {
+        let result = check_source(
+            r#"
+            fn main() {
+                var a: String = "hello";
+                var b: String = "world";
+
+                b = a;
+                let c = a;
+            }
+            "#,
+        );
+
+        assert!(result.has_errors());
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.message.contains("use of moved value `a`") })
+        );
+    }
+
+    #[test]
+    fn accepts_copy_type_after_assignment_move() {
+        let result = check_source(
+            r#"
+            fn main() {
+                var a: Int64 = 10;
+                var b: Int64 = 20;
+
+                b = a;
+                let c = a;
+            }
+            "#,
+        );
+
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn rejects_assignment_move_while_borrow_is_active() {
+        let result = check_source(
+            r#"
+            fn main() {
+                var a: String = "hello";
+                var b: String = "world";
+
+                let r = &a;
+                b = a;
+            }
+            "#,
+        );
+
+        assert!(result.has_errors());
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("cannot move `a` while a shared borrow is active")
+        }));
+    }
+
+    #[test]
+    fn accepts_copy_tuple_after_move() {
+        let result = check_source(
+            r#"
+            fn main() {
+                let pair = (10, true);
+                let other = pair;
+                let again = pair;
+            }
+            "#,
+        );
+
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn rejects_move_of_non_copy_tuple() {
+        let result = check_source(
+            r#"
+            fn main() {
+                let pair = ("hello", 10);
+                let other = pair;
+                let again = pair;
+            }
+            "#,
+        );
+
+        assert!(result.has_errors());
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.message.contains("use of moved value `pair`") })
+        );
+    }
+
+    #[test]
+    fn accepts_tuple_indexing() {
+        let result = check_source(
+            r#"
+            fn main() {
+                let pair = ("hello", 42);
+                let name = pair[0];
+                let age = pair[1];
+            }
+            "#,
+        );
+
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn rejects_tuple_index_out_of_bounds() {
+        let result = check_source(
+            r#"
+            fn main() {
+                let pair = ("hello", 42);
+                let value = pair[2];
+            }
+            "#,
+        );
+
+        assert!(result.has_errors());
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("tuple index 2 is out of bounds")
+        }));
     }
 }
