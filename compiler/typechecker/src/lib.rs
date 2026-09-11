@@ -46,9 +46,20 @@ pub enum Type {
     Unknown,
 }
 
+/// Active borrow state for a binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BorrowState {
+    Shared(usize),
+    Mutable,
+}
+
 /// A local binding known by the type checker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BindingId(usize);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Binding {
+    id: BindingId,
     ty: Type,
     mutable: bool,
     span: Span,
@@ -98,6 +109,9 @@ pub struct TypeChecker {
     functions: HashMap<String, FunctionSignature>,
     diagnostics: Vec<Diagnostic>,
     current_return_type: Type,
+    borrows: HashMap<BindingId, BorrowState>,
+    scope_borrows: Vec<Vec<(BindingId, bool)>>,
+    next_binding_id: usize,
 }
 
 impl TypeChecker {
@@ -107,6 +121,9 @@ impl TypeChecker {
             functions: HashMap::new(),
             diagnostics: Vec::new(),
             current_return_type: Type::Unit,
+            borrows: HashMap::new(),
+            scope_borrows: vec![Vec::new()],
+            next_binding_id: 0,
         }
     }
 
@@ -169,12 +186,15 @@ impl TypeChecker {
         for parameter in &function.parameters {
             let ty = self.lower_type(&parameter.ty);
 
+            let binding_id = self.new_binding_id();
+
             self.scopes
                 .last_mut()
                 .expect("function scope exists")
                 .insert(
                     parameter.name.clone(),
                     Binding {
+                        id: binding_id,
                         ty,
                         mutable: false,
                         span: parameter.span,
@@ -415,10 +435,25 @@ impl TypeChecker {
                         Type::Bool
                     }
 
-                    ast::UnaryOperator::BorrowShared => Type::Reference {
-                        inner: Box::new(operand_type),
-                        mutable: false,
-                    },
+                    ast::UnaryOperator::BorrowShared => {
+                        if let Expr::Identifier(identifier) = unary.operand.as_ref() {
+                            if let Some(binding) = self.lookup(&identifier.name).cloned() {
+                                self.acquire_borrow(
+                                    binding.id,
+                                    false,
+                                    identifier.span,
+                                    &identifier.name,
+                                );
+                            }
+                        } else {
+                            self.error("shared borrow requires an identifier", unary.span);
+                        }
+
+                        Type::Reference {
+                            inner: Box::new(operand_type),
+                            mutable: false,
+                        }
+                    }
 
                     ast::UnaryOperator::BorrowMutable => {
                         match unary.operand.as_ref() {
@@ -431,6 +466,13 @@ impl TypeChecker {
                                                 identifier.name
                                             ),
                                             identifier.span,
+                                        );
+                                    } else {
+                                        self.acquire_borrow(
+                                            binding.id,
+                                            true,
+                                            identifier.span,
+                                            &identifier.name,
                                         );
                                     }
                                 }
@@ -875,9 +917,12 @@ impl TypeChecker {
     fn bind_pattern(&mut self, pattern: &Pattern, ty: Type, mutable: bool) {
         match pattern {
             Pattern::Identifier { name, span } => {
+                let binding_id = self.new_binding_id();
+
                 self.scopes.last_mut().expect("scope exists").insert(
                     name.clone(),
                     Binding {
+                        id: binding_id,
                         ty,
                         mutable,
                         span: *span,
@@ -908,6 +953,79 @@ impl TypeChecker {
         }
     }
 
+    fn new_binding_id(&mut self) -> BindingId {
+        let id = BindingId(self.next_binding_id);
+        self.next_binding_id += 1;
+        id
+    }
+
+    fn acquire_borrow(&mut self, id: BindingId, mutable: bool, span: Span, name: &str) {
+        match (self.borrows.get(&id).copied(), mutable) {
+            (None, false) => {
+                self.borrows.insert(id, BorrowState::Shared(1));
+                self.scope_borrows
+                    .last_mut()
+                    .expect("scope borrow stack exists")
+                    .push((id, false));
+            }
+
+            (Some(BorrowState::Shared(count)), false) => {
+                self.borrows.insert(id, BorrowState::Shared(count + 1));
+                self.scope_borrows
+                    .last_mut()
+                    .expect("scope borrow stack exists")
+                    .push((id, false));
+            }
+
+            (None, true) => {
+                self.borrows.insert(id, BorrowState::Mutable);
+                self.scope_borrows
+                    .last_mut()
+                    .expect("scope borrow stack exists")
+                    .push((id, true));
+            }
+
+            (Some(BorrowState::Shared(_)), true) => {
+                self.error(
+                    format!("cannot mutably borrow `{name}` while shared borrow is active"),
+                    span,
+                );
+            }
+
+            (Some(BorrowState::Mutable), false) => {
+                self.error(
+                    "cannot immutably borrow while a mutable borrow is active",
+                    span,
+                );
+            }
+
+            (Some(BorrowState::Mutable), true) => {
+                self.error(
+                    "cannot mutably borrow while another mutable borrow is active",
+                    span,
+                );
+            }
+        }
+    }
+
+    fn release_borrow(&mut self, id: BindingId, mutable: bool) {
+        match (self.borrows.get(&id).copied(), mutable) {
+            (Some(BorrowState::Shared(count)), false) if count > 1 => {
+                self.borrows.insert(id, BorrowState::Shared(count - 1));
+            }
+
+            (Some(BorrowState::Shared(_)), false) => {
+                self.borrows.remove(&id);
+            }
+
+            (Some(BorrowState::Mutable), true) => {
+                self.borrows.remove(&id);
+            }
+
+            _ => {}
+        }
+    }
+
     fn bind_match_pattern(&mut self, pattern: &Pattern) {
         self.enter_scope();
         self.bind_pattern(pattern, Type::Unknown, false);
@@ -919,11 +1037,20 @@ impl TypeChecker {
 
     fn enter_scope(&mut self) {
         self.scopes.push(HashMap::new());
+        self.scope_borrows.push(Vec::new());
     }
 
     fn exit_scope(&mut self) {
-        if self.scopes.len() > 1 {
-            self.scopes.pop();
+        if self.scopes.len() <= 1 {
+            return;
+        }
+
+        self.scopes.pop();
+
+        let borrows = self.scope_borrows.pop().expect("scope borrow stack exists");
+
+        for (id, mutable) in borrows {
+            self.release_borrow(id, mutable);
         }
     }
 
@@ -1252,5 +1379,79 @@ mod tests {
                 .message
                 .contains("cannot mutably borrow immutable binding `value`")
         }));
+    }
+
+    #[test]
+    fn accepts_multiple_shared_borrows() {
+        let result = check_source(
+            r#"
+            fn main() {
+                var x: Int64 = 10;
+                let a = &x;
+                let b = &x;
+            }
+            "#,
+        );
+
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn rejects_mutable_borrow_while_shared_borrow_is_active() {
+        let result = check_source(
+            r#"
+            fn main() {
+                var x: Int64 = 10;
+                let a = &x;
+                let b = &mut x;
+            }
+            "#,
+        );
+
+        assert!(result.has_errors());
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("cannot mutably borrow `x` while shared borrow is active")
+        }));
+    }
+
+    #[test]
+    fn rejects_two_mutable_borrows() {
+        let result = check_source(
+            r#"
+            fn main() {
+                var x: Int64 = 10;
+                let a = &mut x;
+                let b = &mut x;
+            }
+            "#,
+        );
+
+        assert!(result.has_errors());
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("another mutable borrow is active")
+        }));
+    }
+
+    #[test]
+    fn releases_borrow_when_binding_scope_ends() {
+        let result = check_source(
+            r#"
+            fn main() {
+                var x: Int64 = 10;
+
+                if true {
+                    let shared = &x;
+                }
+
+                let mutable = &mut x;
+            }
+            "#,
+        );
+
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
     }
 }
