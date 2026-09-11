@@ -393,26 +393,58 @@ impl TypeChecker {
             }
 
             Expr::Unary(unary) => {
-                let operand = self.check_expr(&unary.operand);
+                let operand_type = self.check_expr(&unary.operand);
 
                 match unary.operator {
                     ast::UnaryOperator::Neg => {
-                        if !self.is_numeric(&operand) && operand != Type::Unknown {
+                        if !self.is_numeric(&operand_type) && operand_type != Type::Unknown {
                             self.error("unary '-' requires a numeric operand", unary.span);
                         }
 
-                        operand
+                        operand_type
                     }
 
                     ast::UnaryOperator::Not => {
                         self.require_type(
                             &Type::Bool,
-                            &operand,
+                            &operand_type,
                             unary.span,
                             "logical '!' requires Bool",
                         );
 
                         Type::Bool
+                    }
+
+                    ast::UnaryOperator::BorrowShared => Type::Reference {
+                        inner: Box::new(operand_type),
+                        mutable: false,
+                    },
+
+                    ast::UnaryOperator::BorrowMutable => {
+                        match unary.operand.as_ref() {
+                            Expr::Identifier(identifier) => {
+                                if let Some(binding) = self.lookup(&identifier.name).cloned() {
+                                    if !binding.mutable {
+                                        self.error(
+                                            format!(
+                                                "cannot mutably borrow immutable binding `{}`",
+                                                identifier.name
+                                            ),
+                                            identifier.span,
+                                        );
+                                    }
+                                }
+                            }
+
+                            _ => {
+                                self.error("mutable borrow requires an identifier", unary.span);
+                            }
+                        }
+
+                        Type::Reference {
+                            inner: Box::new(operand_type),
+                            mutable: true,
+                        }
                     }
                 }
             }
@@ -1161,5 +1193,64 @@ mod tests {
         );
 
         assert!(result.has_errors());
+    }
+
+    #[test]
+    fn accepts_shared_borrow() {
+        let result = check_source(
+            r#"
+            fn inspect(x: &Int64) {
+                return;
+            }
+
+            fn main() {
+                var value: Int64 = 10;
+                inspect(&value);
+            }
+            "#,
+        );
+
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn accepts_mutable_borrow_from_mutable_binding() {
+        let result = check_source(
+            r#"
+            fn update(x: &mut Int64) {
+                return;
+            }
+
+            fn main() {
+                var value: Int64 = 10;
+                update(&mut value);
+            }
+            "#,
+        );
+
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn rejects_mutable_borrow_from_immutable_binding() {
+        let result = check_source(
+            r#"
+            fn update(x: &mut Int64) {
+                return;
+            }
+
+            fn main() {
+                let value: Int64 = 10;
+                update(&mut value);
+            }
+            "#,
+        );
+
+        assert!(result.has_errors());
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("cannot mutably borrow immutable binding `value`")
+        }));
     }
 }

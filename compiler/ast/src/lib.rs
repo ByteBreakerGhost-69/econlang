@@ -553,4 +553,6 @@ pub enum BinaryOperator {
 pub enum UnaryOperator {
     Neg,
     Not,
+    BorrowShared,
+    BorrowMutable,
 }

@@ -665,9 +665,37 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
-        if self.match_kind(&TokenKind::Minus) {
+        // Shared borrow: `&x`
+        if self.match_kind(&TokenKind::Ampersand) {
+            let start = self.tokens[self.current - 1].span.start;
+
+            let mutable = matches!(
+                self.peek_kind(),
+                TokenKind::Identifier(name) if name == "mut"
+            );
+
+            if mutable {
+                self.advance();
+            }
+
             let operand = self.parse_unary()?;
-            let span = expr_span(&operand);
+            let end = expr_span(&operand).end;
+
+            return Ok(Expr::Unary(UnaryExpr {
+                operator: if mutable {
+                    UnaryOperator::BorrowMutable
+                } else {
+                    UnaryOperator::BorrowShared
+                },
+                operand: Box::new(operand),
+                span: Span::new(start, end),
+            }));
+        }
+
+        if self.match_kind(&TokenKind::Minus) {
+            let start = self.tokens[self.current - 1].span.start;
+            let operand = self.parse_unary()?;
+            let span = Span::new(start, expr_span(&operand).end);
 
             return Ok(Expr::Unary(UnaryExpr {
                 operator: UnaryOperator::Neg,
@@ -677,8 +705,9 @@ impl Parser {
         }
 
         if self.match_kind(&TokenKind::Bang) {
+            let start = self.tokens[self.current - 1].span.start;
             let operand = self.parse_unary()?;
-            let span = expr_span(&operand);
+            let span = Span::new(start, expr_span(&operand).end);
 
             return Ok(Expr::Unary(UnaryExpr {
                 operator: UnaryOperator::Not,
@@ -1295,5 +1324,29 @@ mod tests {
         let program = parser.parse_program().expect("source should parse");
 
         assert_eq!(program.declarations.len(), 2);
+    }
+
+    #[test]
+    fn parses_borrow_expressions() {
+        let source = r#"
+            fn inspect(x: &Int64) {
+                return;
+            }
+
+            fn update(x: &mut Int64) {
+                return;
+            }
+
+            fn main() {
+                var value: Int64 = 10;
+                inspect(&value);
+                update(&mut value);
+            }
+        "#;
+
+        let mut parser = Parser::from_source(source).expect("source should lex");
+        let program = parser.parse_program().expect("source should parse");
+
+        assert_eq!(program.declarations.len(), 3);
     }
 }
