@@ -125,19 +125,76 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> Result<TypeExpr, ParseError> {
+        // Reference type: `&T` or `&mut T`.
+        if self.match_kind(&TokenKind::Ampersand) {
+            let reference_start = self.tokens[self.current - 1].span.start;
+
+            let mutable = matches!(
+                self.peek_kind(),
+                TokenKind::Identifier(name) if name == "mut"
+            );
+
+            if mutable {
+                self.advance();
+            }
+
+            let inner = self.parse_type()?;
+
+            let inner_end = match &inner {
+                TypeExpr::Named { span, .. } => span.end,
+                TypeExpr::Generic { span, .. } => span.end,
+                TypeExpr::Reference { span, .. } => span.end,
+                TypeExpr::Tuple { span, .. } => span.end,
+                TypeExpr::Array { span, .. } => span.end,
+                TypeExpr::Function { span, .. } => span.end,
+            };
+
+            return Ok(TypeExpr::Reference {
+                inner: Box::new(inner),
+                mutable,
+                span: Span::new(reference_start, inner_end),
+            });
+        }
+
         let token = self.advance();
 
-        match token.kind {
-            TokenKind::Identifier(name) => Ok(TypeExpr::Named {
-                name,
-                span: ast_span(token.span),
-            }),
-
-            _ => Err(ParseError {
+        let TokenKind::Identifier(name) = token.kind else {
+            return Err(ParseError {
                 message: "expected a type".to_string(),
                 span: ast_span(token.span),
-            }),
+            });
+        };
+
+        // Generic type: `Vector<Float64>`, `Result<T, E>`, etc.
+        if self.match_kind(&TokenKind::Less) {
+            let mut arguments = Vec::new();
+
+            if !self.check(&TokenKind::Greater) {
+                loop {
+                    arguments.push(self.parse_type()?);
+
+                    if !self.match_kind(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+
+            let end = self.consume(
+                &TokenKind::Greater,
+                "expected '>' after generic type arguments",
+            )?;
+
+            return Ok(TypeExpr::Generic {
+                name,
+                arguments,
+                span: Span::new(token.span.start, end.span.end),
+            });
         }
+
+        Ok(TypeExpr::Named {
+            name,
+            span: ast_span(token.span),
+        })
     }
 
     // -------------------------------------------------------------------------
@@ -1220,5 +1277,23 @@ mod tests {
         let program = parser.parse_program().expect("source should parse");
 
         assert_eq!(program.declarations.len(), 1);
+    }
+
+    #[test]
+    fn parses_reference_types() {
+        let source = r#"
+            fn mean(data: &Vector<Float64>) -> Float64 {
+                return 0.0;
+            }
+
+            fn normalize(data: &mut Vector<Float64>) {
+                return;
+            }
+        "#;
+
+        let mut parser = Parser::from_source(source).expect("source should lex");
+        let program = parser.parse_program().expect("source should parse");
+
+        assert_eq!(program.declarations.len(), 2);
     }
 }

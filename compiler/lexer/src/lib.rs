@@ -74,6 +74,7 @@ pub enum TokenKind {
     LessEqual,
     GreaterEqual,
 
+    Ampersand,
     AndAnd,
     OrOr,
     Bang,
@@ -269,10 +270,7 @@ impl<'a> Lexer<'a> {
                 if self.match_byte(b'&') {
                     TokenKind::AndAnd
                 } else {
-                    return Err(LexError {
-                        message: "expected '&' after '&'".to_string(),
-                        span: self.current_span(start),
-                    });
+                    TokenKind::Ampersand
                 }
             }
 
@@ -597,5 +595,19 @@ mod tests {
         assert_eq!(tokens[0].kind, TokenKind::For);
         assert_eq!(tokens[1].kind, TokenKind::Identifier("i".to_string()));
         assert_eq!(tokens[2].kind, TokenKind::In);
+    }
+
+    #[test]
+    fn lex_reference_operator() {
+        let tokens = Lexer::new("&T &mut Vector<Float64>").tokenize().unwrap();
+
+        assert_eq!(tokens[0].kind, TokenKind::Ampersand);
+        assert!(matches!(tokens[1].kind, TokenKind::Identifier(ref name) if name == "T"));
+        assert_eq!(tokens[2].kind, TokenKind::Ampersand);
+        assert!(matches!(tokens[3].kind, TokenKind::Identifier(ref name) if name == "mut"));
+        assert!(matches!(tokens[4].kind, TokenKind::Identifier(ref name) if name == "Vector"));
+        assert_eq!(tokens[5].kind, TokenKind::Less);
+        assert!(matches!(tokens[6].kind, TokenKind::Identifier(ref name) if name == "Float64"));
+        assert_eq!(tokens[7].kind, TokenKind::Greater);
     }
 }
