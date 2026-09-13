@@ -85,6 +85,11 @@ struct FunctionSignature {
     return_type: Type,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StructDefinition {
+    fields: HashMap<String, Type>,
+}
+
 /// Type checker diagnostic severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticSeverity {
@@ -120,6 +125,7 @@ impl TypeCheckResult {
 pub struct TypeChecker {
     scopes: Vec<HashMap<String, Binding>>,
     functions: HashMap<String, FunctionSignature>,
+    structs: HashMap<String, StructDefinition>,
     diagnostics: Vec<Diagnostic>,
     current_return_type: Type,
     borrows: HashMap<BindingId, BorrowState>,
@@ -133,6 +139,7 @@ impl TypeChecker {
         Self {
             scopes: vec![HashMap::new()],
             functions: HashMap::new(),
+            structs: HashMap::new(),
             diagnostics: Vec::new(),
             current_return_type: Type::Unit,
             borrows: HashMap::new(),
@@ -144,6 +151,7 @@ impl TypeChecker {
 
     /// Type-checks an entire program.
     pub fn check(mut self, program: &Program) -> TypeCheckResult {
+        self.collect_structs(program);
         self.collect_functions(program);
 
         for declaration in &program.declarations {
@@ -166,6 +174,21 @@ impl TypeChecker {
 
         TypeCheckResult {
             diagnostics: self.diagnostics,
+        }
+    }
+
+    fn collect_structs(&mut self, program: &Program) {
+        for declaration in &program.declarations {
+            if let Decl::Struct(struct_decl) = declaration {
+                let fields = struct_decl
+                    .fields
+                    .iter()
+                    .map(|field| (field.name.clone(), self.lower_type(&field.ty)))
+                    .collect();
+
+                self.structs
+                    .insert(struct_decl.name.clone(), StructDefinition { fields });
+            }
         }
     }
 
@@ -519,8 +542,33 @@ impl TypeChecker {
             Expr::Call(call) => self.check_call(call),
 
             Expr::Member(member) => {
-                self.check_expr(&member.object);
-                Type::Unknown
+                let object_type = self.check_expr(&member.object);
+
+                let Type::Named(struct_name) = object_type else {
+                    self.error(
+                        format!(
+                            "member access requires a struct value, got {:?}",
+                            object_type
+                        ),
+                        member.span,
+                    );
+                    return Type::Unknown;
+                };
+
+                let Some(struct_definition) = self.structs.get(&struct_name) else {
+                    self.error(format!("unknown struct `{}`", struct_name), member.span);
+                    return Type::Unknown;
+                };
+
+                let Some(field_type) = struct_definition.fields.get(&member.member) else {
+                    self.error(
+                        format!("struct `{}` has no field `{}`", struct_name, member.member),
+                        member.span,
+                    );
+                    return Type::Unknown;
+                };
+
+                field_type.clone()
             }
 
             Expr::Index(index) => {
@@ -735,8 +783,68 @@ impl TypeChecker {
             }
 
             Expr::StructLiteral(struct_literal) => {
+                let Some(struct_definition) = self.structs.get(&struct_literal.name).cloned()
+                else {
+                    self.error(
+                        format!("unknown struct `{}`", struct_literal.name),
+                        struct_literal.span,
+                    );
+
+                    for field in &struct_literal.fields {
+                        self.check_expr(&field.value);
+                    }
+
+                    return Type::Unknown;
+                };
+
+                let mut initialized_fields = HashSet::new();
+
                 for field in &struct_literal.fields {
-                    self.check_expr(&field.value);
+                    if !initialized_fields.insert(field.name.clone()) {
+                        self.error(
+                            format!(
+                                "duplicate field `{}` in struct `{}`",
+                                field.name, struct_literal.name
+                            ),
+                            field.span,
+                        );
+                        continue;
+                    }
+
+                    let actual_type = self.check_expr(&field.value);
+
+                    let Some(expected_type) = struct_definition.fields.get(&field.name) else {
+                        self.error(
+                            format!(
+                                "unknown field `{}` in struct `{}`",
+                                field.name, struct_literal.name
+                            ),
+                            field.span,
+                        );
+                        continue;
+                    };
+
+                    self.require_assignable(
+                        expected_type,
+                        &actual_type,
+                        field.span,
+                        &format!(
+                            "field `{}` in struct `{}` has incompatible type",
+                            field.name, struct_literal.name
+                        ),
+                    );
+                }
+
+                for field_name in struct_definition.fields.keys() {
+                    if !initialized_fields.contains(field_name) {
+                        self.error(
+                            format!(
+                                "missing field `{}` in struct `{}`",
+                                field_name, struct_literal.name
+                            ),
+                            struct_literal.span,
+                        );
+                    }
                 }
 
                 Type::Named(struct_literal.name.clone())
@@ -2018,5 +2126,172 @@ mod tests {
         );
 
         assert!(result.is_ok(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn accepts_valid_struct_literal() {
+        let result = check_source(
+            r#"
+            struct Person {
+                name: String,
+                age: Int64,
+            }
+
+            fn main() {
+                let person = Person {
+                    name: "Maulana",
+                    age: 20,
+                };
+            }
+            "#,
+        );
+
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn rejects_wrong_struct_field_type() {
+        let result = check_source(
+            r#"
+            struct Person {
+                name: String,
+                age: Int64,
+            }
+
+            fn main() {
+                let person = Person {
+                    name: 20,
+                    age: 20,
+                };
+            }
+            "#,
+        );
+
+        assert!(result.has_errors());
+    }
+
+    #[test]
+    fn rejects_missing_struct_field() {
+        let result = check_source(
+            r#"
+            struct Person {
+                name: String,
+                age: Int64,
+            }
+
+            fn main() {
+                let person = Person {
+                    name: "Maulana",
+                };
+            }
+            "#,
+        );
+
+        assert!(result.has_errors());
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.message.contains("missing field `age`") })
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_struct_field() {
+        let result = check_source(
+            r#"
+            struct Person {
+                name: String,
+                age: Int64,
+            }
+
+            fn main() {
+                let person = Person {
+                    name: "Maulana",
+                    age: 20,
+                    salary: 100,
+                };
+            }
+            "#,
+        );
+
+        assert!(result.has_errors());
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.message.contains("unknown field `salary`") })
+        );
+    }
+
+    #[test]
+    fn accepts_struct_member_access() {
+        let result = check_source(
+            r#"
+            struct Person {
+                name: String,
+                age: Int64,
+            }
+
+            fn main() {
+                let person = Person {
+                    name: "Maulana",
+                    age: 20,
+                };
+
+                let name = person.name;
+                let age = person.age;
+            }
+            "#,
+        );
+
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn rejects_unknown_struct_member() {
+        let result = check_source(
+            r#"
+            struct Person {
+                name: String,
+                age: Int64,
+            }
+
+            fn main() {
+                let person = Person {
+                    name: "Maulana",
+                    age: 20,
+                };
+
+                let address = person.address;
+            }
+            "#,
+        );
+
+        assert!(result.has_errors());
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("struct `Person` has no field `address`")
+        }));
+    }
+
+    #[test]
+    fn rejects_member_access_on_non_struct() {
+        let result = check_source(
+            r#"
+            fn main() {
+                let value: Int64 = 10;
+                let something = value.foo;
+            }
+            "#,
+        );
+
+        assert!(result.has_errors());
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("member access requires a struct value")
+        }));
     }
 }
