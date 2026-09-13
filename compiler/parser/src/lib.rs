@@ -48,6 +48,7 @@ impl Parser {
     fn parse_declaration(&mut self) -> Result<Decl, ParseError> {
         match self.peek_kind() {
             TokenKind::Fn => self.parse_function(),
+            TokenKind::Struct => self.parse_struct(),
             _ => Err(self.error_here("expected a top-level declaration")),
         }
     }
@@ -88,6 +89,57 @@ impl Parser {
             return_type,
             span: Span::new(start, body.span.end),
             body,
+        }))
+    }
+
+    fn parse_struct(&mut self) -> Result<Decl, ParseError> {
+        let start = self.advance().span.start;
+
+        let name_token = self.consume_identifier("expected struct name")?;
+
+        let name = match name_token.kind {
+            TokenKind::Identifier(name) => name,
+            _ => unreachable!(),
+        };
+
+        self.consume(&TokenKind::LeftBrace, "expected '{' after struct name")?;
+
+        let mut fields = Vec::new();
+
+        while !self.check(&TokenKind::RightBrace) {
+            let field_token = self.consume_identifier("expected field name")?;
+
+            let field_name = match field_token.kind {
+                TokenKind::Identifier(name) => name,
+                _ => unreachable!(),
+            };
+
+            self.consume(&TokenKind::Colon, "expected ':' after field name")?;
+
+            let ty = self.parse_type()?;
+
+            fields.push(Field {
+                name: field_name,
+                ty,
+                span: ast_span(field_token.span),
+            });
+
+            if !self.match_kind(&TokenKind::Comma) {
+                break;
+            }
+        }
+
+        let end = self
+            .consume(&TokenKind::RightBrace, "expected '}' after struct fields")?
+            .span
+            .end;
+
+        Ok(Decl::Struct(StructDecl {
+            attributes: Vec::new(),
+            name,
+            generic_params: Vec::new(),
+            fields,
+            span: Span::new(start, end),
         }))
     }
 
@@ -845,10 +897,16 @@ impl Parser {
                 span: ast_span(token.span),
             })),
 
-            TokenKind::Identifier(name) => Ok(Expr::Identifier(IdentifierExpr {
-                name,
-                span: ast_span(token.span),
-            })),
+            TokenKind::Identifier(name) => {
+                if self.check(&TokenKind::LeftBrace) {
+                    self.parse_struct_literal(name, token.span.start)
+                } else {
+                    Ok(Expr::Identifier(IdentifierExpr {
+                        name,
+                        span: ast_span(token.span),
+                    }))
+                }
+            }
 
             TokenKind::If => self.parse_if_expression(token.span.start),
 
@@ -912,6 +970,48 @@ impl Parser {
                 span: ast_span(token.span),
             }),
         }
+    }
+
+    fn parse_struct_literal(&mut self, name: String, start: usize) -> Result<Expr, ParseError> {
+        self.consume(&TokenKind::LeftBrace, "expected '{' after struct name")?;
+
+        let mut fields = Vec::new();
+
+        while !self.check(&TokenKind::RightBrace) {
+            let field_token = self.consume_identifier("expected struct field name")?;
+
+            let field_name = match field_token.kind {
+                TokenKind::Identifier(name) => name,
+                _ => unreachable!(),
+            };
+
+            self.consume(&TokenKind::Colon, "expected ':' after struct field name")?;
+
+            let value = self.parse_expression()?;
+
+            let end = expr_span(&value).end;
+
+            fields.push(StructFieldInit {
+                name: field_name,
+                value,
+                span: Span::new(field_token.span.start, end),
+            });
+
+            if !self.match_kind(&TokenKind::Comma) {
+                break;
+            }
+        }
+
+        let end = self
+            .consume(&TokenKind::RightBrace, "expected '}' after struct literal")?
+            .span
+            .end;
+
+        Ok(Expr::StructLiteral(StructLiteralExpr {
+            name,
+            fields,
+            span: Span::new(start, end),
+        }))
     }
 
     fn parse_if_expression(&mut self, start: usize) -> Result<Expr, ParseError> {
