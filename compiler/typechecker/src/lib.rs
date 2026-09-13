@@ -4,7 +4,7 @@ use ast::{
     BinaryOperator, BlockExpr, CallExpr, Decl, Expr, FunctionDecl, LiteralValue, Pattern, Program,
     Span, Stmt, TypeExpr,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Internal semantic type representation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +58,11 @@ enum BorrowState {
 enum OwnershipState {
     Available,
     Moved,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PartialMoveState {
+    moved_indices: HashSet<usize>,
 }
 
 /// A local binding known by the type checker.
@@ -119,6 +124,7 @@ pub struct TypeChecker {
     current_return_type: Type,
     borrows: HashMap<BindingId, BorrowState>,
     scope_borrows: Vec<Vec<(BindingId, bool)>>,
+    partial_moves: HashMap<BindingId, PartialMoveState>,
     next_binding_id: usize,
 }
 
@@ -131,6 +137,7 @@ impl TypeChecker {
             current_return_type: Type::Unit,
             borrows: HashMap::new(),
             scope_borrows: vec![Vec::new()],
+            partial_moves: HashMap::new(),
             next_binding_id: 0,
         }
     }
@@ -530,6 +537,17 @@ impl TypeChecker {
                                 index_expr_span(index_expr).end,
                             ),
                         );
+                    }
+                }
+
+                if index.indices.len() == 1 {
+                    if let Expr::Identifier(identifier) = index.object.as_ref() {
+                        if let Some(index_value) = tuple_index_value(&index.indices[0]) {
+                            if matches!(object_type, Type::Tuple(_)) {
+                                return self
+                                    .check_move_tuple_index(identifier, index_value as usize);
+                            }
+                        }
                     }
                 }
 
@@ -1104,6 +1122,70 @@ impl TypeChecker {
         for (id, mutable) in borrows {
             self.release_borrow(id, mutable);
         }
+    }
+
+    fn check_move_tuple_index(&mut self, identifier: &ast::IdentifierExpr, index: usize) -> Type {
+        let Some(binding) = self.lookup(&identifier.name).cloned() else {
+            return Type::Unknown;
+        };
+
+        if let Some(borrow_state) = self.borrows.get(&binding.id).copied() {
+            let message = match borrow_state {
+                BorrowState::Shared(_) => {
+                    format!(
+                        "cannot move `{}` while a shared borrow is active",
+                        identifier.name
+                    )
+                }
+                BorrowState::Mutable => {
+                    format!(
+                        "cannot move `{}` while a mutable borrow is active",
+                        identifier.name
+                    )
+                }
+            };
+
+            self.error(message, identifier.span);
+            return Type::Unknown;
+        }
+
+        let Type::Tuple(elements) = &binding.ty else {
+            return Type::Unknown;
+        };
+
+        let Some(element_type) = elements.get(index).cloned() else {
+            self.error(
+                format!("tuple index {} is out of bounds", index),
+                identifier.span,
+            );
+            return Type::Unknown;
+        };
+
+        if self.is_copy_type(&element_type) {
+            return element_type;
+        }
+
+        if binding.ownership == OwnershipState::Moved {
+            self.error(
+                format!("use of moved value `{}`", identifier.name),
+                identifier.span,
+            );
+            return element_type;
+        }
+
+        let state = self.partial_moves.entry(binding.id).or_default();
+
+        if !state.moved_indices.insert(index) {
+            self.error(
+                format!(
+                    "use of moved tuple element `{}[{}]`",
+                    identifier.name, index
+                ),
+                identifier.span,
+            );
+        }
+
+        element_type
     }
 
     fn check_move_identifier(&mut self, identifier: &ast::IdentifierExpr) -> Type {
@@ -1899,5 +1981,42 @@ mod tests {
                 .message
                 .contains("tuple index 2 is out of bounds")
         }));
+    }
+
+    #[test]
+    fn rejects_reusing_moved_tuple_element() {
+        let result = check_source(
+            r#"
+            fn main() {
+                let pair = ("hello", 42);
+
+                let name = pair[0];
+                let again = pair[0];
+            }
+            "#,
+        );
+
+        assert!(result.has_errors());
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("use of moved tuple element `pair[0]`")
+        }));
+    }
+
+    #[test]
+    fn accepts_using_different_tuple_elements_after_partial_move() {
+        let result = check_source(
+            r#"
+            fn main() {
+                let pair = ("hello", 42);
+
+                let name = pair[0];
+                let age = pair[1];
+            }
+            "#,
+        );
+
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
     }
 }
