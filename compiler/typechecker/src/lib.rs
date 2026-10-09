@@ -60,9 +60,15 @@ enum OwnershipState {
     Moved,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum MovePath {
+    TupleIndex(usize),
+    StructField(String),
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct PartialMoveState {
-    moved_indices: HashSet<usize>,
+    moved_paths: HashSet<MovePath>,
 }
 
 /// A local binding known by the type checker.
@@ -277,6 +283,11 @@ impl TypeChecker {
                     .as_ref()
                     .map(|expr| match expr {
                         Expr::Identifier(identifier) => self.check_move_identifier(identifier),
+                        Expr::Member(member) => self.check_move_struct_field(
+                            &member.object,
+                            &member.member,
+                            member.span,
+                        ),
                         _ => self.check_expr(expr),
                     })
                     .unwrap_or(Type::Unknown);
@@ -1283,7 +1294,7 @@ impl TypeChecker {
 
         let state = self.partial_moves.entry(binding.id).or_default();
 
-        if !state.moved_indices.insert(index) {
+        if !state.moved_paths.insert(MovePath::TupleIndex(index)) {
             self.error(
                 format!(
                     "use of moved tuple element `{}[{}]`",
@@ -1294,6 +1305,97 @@ impl TypeChecker {
         }
 
         element_type
+    }
+
+    fn check_move_struct_field(
+        &mut self,
+        object: &Expr,
+        field_name: &str,
+        field_span: Span,
+    ) -> Type {
+        let Expr::Identifier(identifier) = object else {
+            self.error(
+                "moving a struct field currently requires a local variable",
+                field_span,
+            );
+            return Type::Unknown;
+        };
+
+        let Some(binding) = self.lookup(&identifier.name).cloned() else {
+            return Type::Unknown;
+        };
+
+        if let Some(borrow_state) = self.borrows.get(&binding.id).copied() {
+            let message = match borrow_state {
+                BorrowState::Shared(_) => {
+                    format!(
+                        "cannot move `{}` while a shared borrow is active",
+                        identifier.name
+                    )
+                }
+                BorrowState::Mutable => {
+                    format!(
+                        "cannot move `{}` while a mutable borrow is active",
+                        identifier.name
+                    )
+                }
+            };
+
+            self.error(message, field_span);
+            return Type::Unknown;
+        }
+
+        if binding.ownership == OwnershipState::Moved {
+            self.error(
+                format!("use of moved value `{}`", identifier.name),
+                field_span,
+            );
+            return Type::Unknown;
+        }
+
+        let Type::Named(struct_name) = &binding.ty else {
+            self.error(
+                format!(
+                    "member access requires a struct value, got {:?}",
+                    binding.ty
+                ),
+                field_span,
+            );
+            return Type::Unknown;
+        };
+
+        let Some(struct_definition) = self.structs.get(struct_name) else {
+            return Type::Unknown;
+        };
+
+        let Some(field_type) = struct_definition.fields.get(field_name).cloned() else {
+            self.error(
+                format!("struct `{}` has no field `{}`", struct_name, field_name),
+                field_span,
+            );
+            return Type::Unknown;
+        };
+
+        if self.is_copy_type(&field_type) {
+            return field_type;
+        }
+
+        let state = self.partial_moves.entry(binding.id).or_default();
+
+        if !state
+            .moved_paths
+            .insert(MovePath::StructField(field_name.to_string()))
+        {
+            self.error(
+                format!(
+                    "use of moved struct field `{}.{}`",
+                    identifier.name, field_name
+                ),
+                field_span,
+            );
+        }
+
+        field_type
     }
 
     fn check_move_identifier(&mut self, identifier: &ast::IdentifierExpr) -> Type {
@@ -1324,6 +1426,21 @@ impl TypeChecker {
         if binding.ownership == OwnershipState::Moved {
             self.error(
                 format!("use of moved value `{}`", identifier.name),
+                identifier.span,
+            );
+            return binding.ty;
+        }
+
+        if self
+            .partial_moves
+            .get(&binding.id)
+            .is_some_and(|state| !state.moved_paths.is_empty())
+        {
+            self.error(
+                format!(
+                    "cannot move `{}` because part of it has already been moved",
+                    identifier.name
+                ),
                 identifier.span,
             );
             return binding.ty;
@@ -2292,6 +2409,111 @@ mod tests {
             diagnostic
                 .message
                 .contains("member access requires a struct value")
+        }));
+    }
+
+    #[test]
+    fn accepts_partial_move_of_struct_fields() {
+        let result = check_source(
+            r#"
+        struct Person {
+            name: String,
+            age: Int64,
+        }
+
+        fn main() {
+            let person = Person {
+                name: "Maulana",
+                age: 20,
+            };
+
+            let name = person.name;
+            let age = person.age;
+        }
+        "#,
+        );
+
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn accepts_reusing_copy_struct_field() {
+        let result = check_source(
+            r#"
+            struct Person {
+                name: String,
+                age: Int64,
+            }
+
+            fn main() {
+                let person = Person {
+                    name: "Maulana",
+                    age: 20,
+                };
+
+                let age1 = person.age;
+                let age2 = person.age;
+            }
+            "#,
+        );
+
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn rejects_moving_struct_after_partial_move() {
+        let result = check_source(
+            r#"
+            struct Person {
+                name: String,
+                age: Int64,
+            }
+
+            fn consume(person: Person) {
+                return;
+            }
+
+            fn main() {
+                let person = Person {
+                    name: "Maulana",
+                    age: 20,
+                };
+
+                let name = person.name;
+                consume(person);
+            }
+            "#,
+        );
+
+        assert!(result.has_errors());
+    }
+
+    #[test]
+    fn rejects_reusing_moved_struct_field() {
+        let result = check_source(
+            r#"
+        struct Person {
+            name: String,
+            age: Int64,
+        }
+
+        fn main() {
+            let person = Person {
+                name: "Maulana",
+                age: 20,
+            };
+
+            let name1 = person.name;
+            let name2 = person.name;
+        }
+        "#,
+        );
+
+        assert!(result.has_errors());
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("use of moved struct field `person.name`")
         }));
     }
 }
