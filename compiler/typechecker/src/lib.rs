@@ -1149,6 +1149,18 @@ impl TypeChecker {
     }
 
     fn acquire_borrow(&mut self, id: BindingId, mutable: bool, span: Span, name: &str) {
+        if self
+            .partial_moves
+            .get(&id)
+            .is_some_and(|state| !state.moved_paths.is_empty())
+        {
+            self.error(
+                format!("cannot borrow `{name}` because part of it has already been moved"),
+                span,
+            );
+            return;
+        }
+
         match (self.borrows.get(&id).copied(), mutable) {
             (None, false) => {
                 self.borrows.insert(id, BorrowState::Shared(1));
@@ -2481,6 +2493,30 @@ mod tests {
 
                 let name = person.name;
                 consume(person);
+            }
+            "#,
+        );
+
+        assert!(result.has_errors());
+    }
+
+    #[test]
+    fn rejects_borrowing_struct_after_partial_move() {
+        let result = check_source(
+            r#"
+            struct Person {
+                name: String,
+                age: Int64,
+            }
+
+            fn main() {
+                let person = Person {
+                    name: "Maulana",
+                    age: 20,
+                };
+
+                let name = person.name;
+                let borrowed = &person;
             }
             "#,
         );
