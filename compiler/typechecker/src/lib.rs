@@ -2501,6 +2501,30 @@ mod tests {
     }
 
     #[test]
+    fn accepts_access_to_other_field_after_partial_move() {
+        let result = check_source(
+            r#"
+            struct Person {
+                name: String,
+                age: Int64,
+            }
+
+            fn main() {
+                let person = Person {
+                    name: "Maulana",
+                    age: 20,
+                };
+
+                let name = person.name;
+                let age = person.age;
+            }
+            "#,
+        );
+
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
     fn rejects_borrowing_struct_after_partial_move() {
         let result = check_source(
             r#"
